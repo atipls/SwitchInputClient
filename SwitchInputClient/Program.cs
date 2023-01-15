@@ -245,6 +245,8 @@ public static class Program {
             if (serialPort.BytesToRead > 0)
                 Console.Write(serialPort.ReadExisting());
 
+            
+            
             if (lastHash == packet.GetHashCode()) {
                 lastTick = SDL.SDL_GetTicks();
                 continue;
@@ -254,7 +256,7 @@ public static class Program {
 
             var serialized = packet.Serialize();
             serialPort.Write(serialized, 0, serialized.Length);
-            lastFrame = DateTime.Now;
+
             lastHash = packet.GetHashCode();
             lastTick = SDL.SDL_GetTicks();
 

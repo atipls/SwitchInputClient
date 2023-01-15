@@ -24,29 +24,36 @@
 #define LED_GPIO 2
 #define PIN_SEL (1ULL << LED_GPIO)
 
-// Buttons and sticks
-#define A_DPAD_CENTER 0x08
-#define A_DPAD_U 0x00
-#define A_DPAD_U_R 0x01
-#define A_DPAD_R 0x02
-#define A_DPAD_D_R 0x03
-#define A_DPAD_D 0x04
-#define A_DPAD_D_L 0x05
-#define A_DPAD_L 0x06
-#define A_DPAD_U_L 0x07
+enum {
+    DPAD_UP = 0,
+    DPAD_UP_RIGHT,
+    DPAD_RIGHT,
+    DPAD_DOWN_RIGHT,
+    DPAD_DOWN,
+    DPAD_DOWN_LEFT,
+    DPAD_LEFT,
+    DPAD_UP_LEFT,
+    DPAD_CENTER,
+};
 
-// From least to most significant bits:
-// (Right)  Y, X, B, A, SR, SL, R, ZR
-static uint8_t but1_send = 0;
-// (Shared)  -, +, Rs, Ls, H, Cap, --, Charging Grip
-static uint8_t but2_send = 0;
-// (Left)  D, U, R, L, SR, SL, L, ZL
-static uint8_t but3_send = 0;
+enum {
+    DPAD_SET_UP = 1 << 0,
+    DPAD_SET_DOWN = 1 << 1,
+    DPAD_SET_LEFT = 1 << 2,
+    DPAD_SET_RIGHT = 1 << 3,
+};
 
-static uint8_t lx_send = 128;
-static uint8_t ly_send = 128;
-static uint8_t cx_send = 128;
-static uint8_t cy_send = 128;
+static struct {
+    uint8_t buttons1;// (Right)  Y, X, B, A, SR, SL, R, ZR
+    uint8_t buttons2;// (Shared)  -, +, Rs, Ls, H, Cap, --, Charging Grip
+    uint8_t buttons3;// (Left)  D, U, R, L, SR, SL, L, ZL
+
+    uint8_t lx;
+    uint8_t ly;
+
+    uint8_t cx;
+    uint8_t cy;
+} xReport;
 
 SemaphoreHandle_t xSemaphore;
 
@@ -66,23 +73,35 @@ QueueHandle_t uart_queue;
 
 #define BUF_SIZE (8192)
 
-uint8_t *uart_data;
+static uint8_t *uart_data;
 
-uint8_t crc8_ccitt_update(uint8_t inCrc, uint8_t inData) {
-    uint8_t i;
-    uint8_t data;
+static uint8_t uartUpdateCrc(uint8_t previous_crc, uint8_t new_data) {
+    uint8_t current = previous_crc ^ new_data;
 
-    data = inCrc ^ inData;
-
-    for (i = 0; i < 8; i++) {
-        if ((data & 0x80) != 0) {
-            data <<= 1;
-            data ^= 0x07;
+    for (uint8_t i = 0; i < 8; i++) {
+        if ((current & 0x80) != 0) {
+            current <<= 1;
+            current ^= 0x07;
         } else {
-            data <<= 1;
+            current <<= 1;
         }
     }
-    return data;
+    return current;
+}
+
+uint8_t appGetUartStatus(uint8_t data) {
+    switch (uart_data[2]) {
+        case DPAD_UP: return DPAD_SET_UP;
+        case DPAD_UP_RIGHT: return DPAD_SET_UP | DPAD_SET_RIGHT;
+        case DPAD_RIGHT: return DPAD_SET_RIGHT;
+        case DPAD_DOWN_RIGHT: return DPAD_SET_DOWN | DPAD_SET_RIGHT;
+        case DPAD_DOWN: return DPAD_SET_DOWN;
+        case DPAD_DOWN_LEFT: return DPAD_SET_DOWN | DPAD_SET_LEFT;
+        case DPAD_LEFT: return DPAD_SET_LEFT;
+        case DPAD_UP_LEFT: return DPAD_SET_UP | DPAD_SET_LEFT;
+        case DPAD_CENTER:
+        default: return 0;
+    }
 }
 
 void appUARTInit() {
@@ -94,8 +113,10 @@ void appUARTInit() {
     uart_config.source_clk = UART_SCLK_DEFAULT;
 
     uart_param_config(UART_NUM_0, &uart_config);
-    uart_set_pin(UART_NUM_0, UART_PIN_NO_CHANGE, UART_PIN_NO_CHANGE, UART_PIN_NO_CHANGE, UART_PIN_NO_CHANGE);
-    ESP_ERROR_CHECK(uart_driver_install(UART_NUM_0, BUF_SIZE * 2, BUF_SIZE * 2, 10, &uart_queue, 0));
+    uart_set_pin(UART_NUM_0, UART_PIN_NO_CHANGE, UART_PIN_NO_CHANGE,
+                 UART_PIN_NO_CHANGE, UART_PIN_NO_CHANGE);
+    ESP_ERROR_CHECK(uart_driver_install(UART_NUM_0, BUF_SIZE * 2, BUF_SIZE * 2,
+                                        10, &uart_queue, 0));
 
     uart_data = (uint8_t *) malloc(BUF_SIZE);
 }
@@ -110,123 +131,82 @@ static void appUARTTask() {
 
         uint8_t current_crc = 0;
         for (uint8_t i = 0; i < 8; i++)
-            current_crc = crc8_ccitt_update(current_crc, uart_data[i]);
+            current_crc = uartUpdateCrc(current_crc, uart_data[i]);
 
-        if (current_crc == uart_data[8]) {
-            uart_data[0] &= ~(1 << 7);// Clear SL
-            uart_data[0] &= ~(1 << 6);// Clear SR
-
-            // If this is a right joycon or a procon.
-            but1_send = (((uart_data[1] >> 0) & 1) << 0) +// Y
-                        (((uart_data[1] >> 3) & 1) << 1) +// X
-                        (((uart_data[1] >> 1) & 1) << 2) +// B
-                        (((uart_data[1] >> 2) & 1) << 3) +// A
-                        (((uart_data[0] >> 7) & 1) << 4) +// SR
-                        (((uart_data[0] >> 6) & 1) << 5) +// SL
-                        (((uart_data[1] >> 5) & 1) << 6) +// R
-                        (((uart_data[1] >> 7) & 1) << 7); // ZR
-
-            but2_send = (((uart_data[0] >> 4) & 1) << 4) +// Home
-                        (((uart_data[0] >> 1) & 1) << 1) +// +/Start
-                        (((uart_data[0] >> 3) & 1) << 2); // R Stick Click
-
-            cx_send = uart_data[5];
-            cy_send = 255 - uart_data[6];
-
-            // This is a bit of an ugly solution, but it's the first thing
-            // that came to mind.
-            bool dpad_d = false;
-            bool dpad_u = false;
-            bool dpad_r = false;
-            bool dpad_l = false;
-
-            switch (uart_data[2]) {
-                case A_DPAD_CENTER:
-                    break;
-                case A_DPAD_U:
-                    dpad_u = true;
-                    break;
-                case A_DPAD_R:
-                    dpad_r = true;
-                    break;
-                case A_DPAD_D:
-                    dpad_d = true;
-                    break;
-                case A_DPAD_L:
-                    dpad_l = true;
-                    break;
-                case A_DPAD_U_R:
-                    dpad_u = true;
-                    dpad_r = true;
-                    break;
-                case A_DPAD_U_L:
-                    dpad_u = true;
-                    dpad_l = true;
-                    break;
-                case A_DPAD_D_R:
-                    dpad_d = true;
-                    dpad_r = true;
-                    break;
-                case A_DPAD_D_L:
-                    dpad_d = true;
-                    dpad_l = true;
-                    break;
-
-                default:
-                    break;
-            }
-
-            but3_send = ((dpad_d) << 0) +                 // Down
-                        ((dpad_u) << 1) +                 // Up
-                        ((dpad_r) << 2) +                 // Right
-                        ((dpad_l) << 3) +                 // Left
-                        (((uart_data[0] >> 7) & 1) << 4) +// SR
-                        (((uart_data[0] >> 6) & 1) << 5) +// SL
-                        (((uart_data[1] >> 4) & 1) << 6) +// L
-                        (((uart_data[1] >> 6) & 1) << 7); // ZL
-
-            but2_send += (((uart_data[0] >> 5) & 1) << 5) +// Capture
-                         (((uart_data[0] >> 0) & 1) << 0) +// -/Select
-                         (((uart_data[0] >> 2) & 1) << 3); // L Stick Click
-            lx_send = uart_data[3];
-            ly_send = 255 - uart_data[4];
-        } else {
+        if (current_crc != uart_data[8]) {
             ESP_LOGI("CRC Error",
                      "Packet specified CRC 0x%02x but calculated CRC was 0x%02x",
                      uart_data[8], current_crc);
-            ESP_LOGI(
-                    "CRC Error",
-                    "Packet data: %02x %02x %02x %02x %02x %02x %02x %02x %02x\n",
-                    uart_data[0], uart_data[1], uart_data[2], uart_data[3],
-                    uart_data[4], uart_data[5], uart_data[6], uart_data[7],
-                    uart_data[8]);
+            ESP_LOGI("CRC Error",
+                     "Packet data: %02x %02x %02x %02x %02x %02x %02x %02x %02x\n",
+                     uart_data[0], uart_data[1], uart_data[2], uart_data[3],
+                     uart_data[4], uart_data[5], uart_data[6], uart_data[7],
+                     uart_data[8]);
+            vTaskDelay(pdMS_TO_TICKS(15));
+            continue;
         }
+        uint8_t dpad_status = appGetUartStatus(uart_data[2]);
 
+        // This is not a joycon, so no SL/SR.
+        uart_data[0] &= ~(1 << 7);// Clear SL
+        uart_data[0] &= ~(1 << 6);// Clear SR
+
+        xReport.buttons1 = (((uart_data[1] >> 0) & 1) << 0) |// Y
+                           (((uart_data[1] >> 3) & 1) << 1) |// X
+                           (((uart_data[1] >> 1) & 1) << 2) |// B
+                           (((uart_data[1] >> 2) & 1) << 3) |// A
+                           (((uart_data[0] >> 7) & 1) << 4) |// SR
+                           (((uart_data[0] >> 6) & 1) << 5) |// SL
+                           (((uart_data[1] >> 5) & 1) << 6) |// R
+                           (((uart_data[1] >> 7) & 1) << 7); // ZR
+
+        xReport.buttons2 = (((uart_data[0] >> 0) & 1) << 0) |// -/Select
+                           (((uart_data[0] >> 1) & 1) << 1) |// +/Start
+                           (((uart_data[0] >> 3) & 1) << 2) |// R Stick Click
+                           (((uart_data[0] >> 2) & 1) << 3) |// L Stick Click
+                           (((uart_data[0] >> 4) & 1) << 4) |// Home
+                           (((uart_data[0] >> 5) & 1) << 5); // Capture
+
+        xReport.buttons3 = (((dpad_status & DPAD_SET_DOWN) ? 0 : 1) << 0) | // Down
+                           (((dpad_status & DPAD_SET_UP) ? 0 : 1) << 1) |   // Up
+                           (((dpad_status & DPAD_SET_RIGHT) ? 0 : 1) << 2) |// Right
+                           (((dpad_status & DPAD_SET_LEFT) ? 0 : 1) << 3) | // Left
+                           (((uart_data[0] >> 7) & 1) << 4) |               // SR
+                           (((uart_data[0] >> 6) & 1) << 5) |               // SL
+                           (((uart_data[1] >> 4) & 1) << 6) |               // L
+                           (((uart_data[1] >> 6) & 1) << 7);                // ZL
+
+
+        xReport.lx = uart_data[3];
+        xReport.ly = 255 - uart_data[4];
+
+        xReport.cx = uart_data[5];
+        xReport.cy = 255 - uart_data[6];
         vTaskDelay(pdMS_TO_TICKS(15));
     }
 }
 
 static uint8_t report30[48] = {[0] = 0x00, [1] = 0x8E, [11] = 0x80};
+
 void appSENDTask() {
     ESP_LOGI("SENDER", "Sending hid reports on core %d\n", xPortGetCoreID());
 
-    while (1) {
+    while (true) {
         xSemaphoreTake(xSemaphore, portMAX_DELAY);
+
         report30[0] = timer;
 
-        // buttons
-        report30[2] = but1_send;
-        report30[3] = but2_send;
-        report30[4] = but3_send;
+        report30[2] = xReport.buttons1;
+        report30[3] = xReport.buttons2;
+        report30[4] = xReport.buttons3;
 
-        // encode left stick
-        report30[5] = (lx_send << 4) & 0xF0;
-        report30[6] = (lx_send & 0xF0) >> 4;
-        report30[7] = ly_send;
-        // encode right stick
-        report30[8] = (cx_send << 4) & 0xF0;
-        report30[9] = (cx_send & 0xF0) >> 4;
-        report30[10] = cy_send;
+        report30[5] = (xReport.lx << 4) & 0xF0;
+        report30[6] = (xReport.lx & 0xF0) >> 4;
+        report30[7] = xReport.ly;
+
+        report30[8] = (xReport.cx << 4) & 0xF0;
+        report30[9] = (xReport.cx & 0xF0) >> 4;
+        report30[10] = xReport.cy;
 
         xSemaphoreGive(xSemaphore);
 
@@ -237,17 +217,6 @@ void appSENDTask() {
         if (paired || connected) {
             esp_bt_hid_device_send_report(ESP_HIDD_REPORT_TYPE_INTRDATA, 0x30,
                                           sizeof(report30), report30);
-
-            if (but1_send || but2_send || but3_send)
-                ESP_LOGI("debug", "but1: %d, but2: %d, but3: %d\n", but1_send, but2_send,
-                         but3_send);
-
-            if ((lx_send != 128 && lx_send != 127) ||
-                (ly_send != 128 && ly_send != 127) ||
-                (cx_send != 128 && cx_send != 127) ||
-                (cy_send != 128 && cy_send != 127))
-                ESP_LOGI("debug", "lx: %d, ly: %d, cx: %d, cy: %d\n", lx_send, ly_send,
-                         cx_send, cy_send);
         }
 
         vTaskDelay(pdMS_TO_TICKS(15));
@@ -255,34 +224,33 @@ void appSENDTask() {
 }
 
 esp_err_t set_bt_address() {
-    nvs_handle my_handle;
-    esp_err_t err;
+    nvs_handle nvs_handle;
     uint8_t bt_addr[8];
 
-    err = nvs_open("storage", NVS_READWRITE, &my_handle);
+    esp_err_t err = nvs_open("storage", NVS_READWRITE, &nvs_handle);
     if (err != ESP_OK)
         return err;
 
     size_t addr_size = 0;
-    err = nvs_get_blob(my_handle, "mac_addr", NULL, &addr_size);
+    err = nvs_get_blob(nvs_handle, "mac_addr", NULL, &addr_size);
     if (err != ESP_OK && err != ESP_ERR_NVS_NOT_FOUND)
         return err;
 
     if (addr_size > 0) {
-        err = nvs_get_blob(my_handle, "mac_addr", bt_addr, &addr_size);
+        err = nvs_get_blob(nvs_handle, "mac_addr", bt_addr, &addr_size);
     } else {
-        for (int i = 0; i < 8; i++)
+        for (uint8_t i = 0; i < 8; i++)
             bt_addr[i] = random() % 255;
         size_t addr_size = sizeof(bt_addr);
-        err = nvs_set_blob(my_handle, "mac_addr", bt_addr, addr_size);
+        err = nvs_set_blob(nvs_handle, "mac_addr", bt_addr, addr_size);
     }
 
-    err = nvs_commit(my_handle);
-    nvs_close(my_handle);
+    err = nvs_commit(nvs_handle);
+    nvs_close(nvs_handle);
     esp_base_mac_addr_set(bt_addr);
 
     // put mac addr in switch pairing packet
-    for (int z = 0; z < 6; z++)
+    for (uint8_t z = 0; z < 6; z++)
         reply02[z + 19] = bt_addr[z];
 
     return ESP_OK;
@@ -370,7 +338,8 @@ void esp_bt_hidd_cb(esp_hidd_cb_event_t event, esp_hidd_cb_param_t *param) {
                                  param->open.bd_addr[4], param->open.bd_addr[5]);
 
                         ESP_LOGI(TAG, "making self non-discoverable and non-connectable.");
-                        esp_bt_gap_set_scan_mode(ESP_BT_NON_CONNECTABLE, ESP_BT_NON_DISCOVERABLE);
+                        esp_bt_gap_set_scan_mode(ESP_BT_NON_CONNECTABLE,
+                                                 ESP_BT_NON_DISCOVERABLE);
 
                         xSemaphoreTake(xSemaphore, portMAX_DELAY);
                         connected = true;
@@ -381,7 +350,8 @@ void esp_bt_hidd_cb(esp_hidd_cb_event_t event, esp_hidd_cb_param_t *param) {
                             appSendTaskHandle = NULL;
                         }
 
-                        xTaskCreatePinnedToCore(appSENDTask, "SEND Task", 4096, NULL, 2, &appSendTaskHandle, 0);
+                        xTaskCreatePinnedToCore(appSENDTask, "SEND Task", 4096, NULL, 2,
+                                                &appSendTaskHandle, 0);
                         break;
                     default:
                         break;
@@ -412,9 +382,7 @@ void esp_bt_hidd_cb(esp_hidd_cb_event_t event, esp_hidd_cb_param_t *param) {
                 ESP_LOGE(TAG, "close failed!");
             }
             break;
-        case ESP_HIDD_SEND_REPORT_EVT: 
-            ESP_LOGI(TAG, "ESP_HIDD_SEND_REPORT_EVT");
-            break;
+        case ESP_HIDD_SEND_REPORT_EVT: break;
         case ESP_HIDD_REPORT_ERR_EVT:
             ESP_LOGI(TAG, "ESP_HIDD_REPORT_ERR_EVT");
             break;
@@ -435,8 +403,8 @@ void esp_bt_hidd_cb(esp_hidd_cb_event_t event, esp_hidd_cb_param_t *param) {
             }
             break;
         case ESP_HIDD_INTR_DATA_EVT:
-            ESP_LOGI(TAG, "ESP_HIDD_INTR_DATA_EVT");
-            ESP_LOG_BUFFER_HEX(TAG, param->intr_data.data, param->intr_data.len);
+            // ESP_LOGI(TAG, "ESP_HIDD_INTR_DATA_EVT");
+            // ESP_LOG_BUFFER_HEX(TAG, param->intr_data.data, param->intr_data.len);
 
             if (param->intr_data.data[9] == 2)
                 esp_bt_hid_device_send_report(ESP_HIDD_REPORT_TYPE_INTRDATA, 0x21,
@@ -509,6 +477,8 @@ void esp_bt_hidd_cb(esp_hidd_cb_event_t event, esp_hidd_cb_param_t *param) {
             ESP_LOGI(TAG, "ESP_HIDD_VC_UNPLUG_EVT");
             if (param->vc_unplug.status == ESP_HIDD_SUCCESS) {
                 if (param->close.conn_status == ESP_HIDD_CONN_STATE_DISCONNECTED) {
+                    connected = false;
+                    paired = false;
                     ESP_LOGI(TAG, "disconnected!");
 
                     ESP_LOGI(TAG, "making self discoverable and connectable again.");
@@ -528,12 +498,15 @@ void esp_bt_hidd_cb(esp_hidd_cb_event_t event, esp_hidd_cb_param_t *param) {
 
 void app_main() {
     appUARTInit();
-    xTaskCreatePinnedToCore(appUARTTask, "UART Task", 2048, NULL, 1, &appUartTaskHandle, 1);
-
-    esp_err_t ret;
-    static esp_bt_cod_t dclass;
 
     xSemaphore = xSemaphoreCreateMutex();
+
+    xTaskCreatePinnedToCore(appUARTTask, "UART Task", 2048, NULL, 1,
+                            &appUartTaskHandle, 1);
+
+    esp_err_t ret;
+
+    static esp_bt_cod_t dclass;
 
     gpio_config_t io_conf;
     io_conf.intr_type = GPIO_INTR_DISABLE;
@@ -549,6 +522,7 @@ void app_main() {
     app_param.subclass = 0x8;
     app_param.desc_list = hid_descriptor;
     app_param.desc_list_len = hid_descriptor_len;
+
     memset(&qos_param, 0, sizeof(esp_hidd_qos_param_t));
 
     dclass.minor = 2;
